@@ -1,0 +1,256 @@
+name: Build Yoga Slim 7x Omarchy ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    outputs:
+      artifact: ${{ steps.meta.outputs.artifact }}
+    env:
+      ARCH: aarch64
+      INPUT_MIRROR: edge
+      INPUT_PACKAGES: >-
+        omarchy-keyring ttf-jetbrains-mono-nerd-basic limine-mkinitcpio-hook limine-snapper-sync
+        linux-aarch64-pkgbase-shim qcom-firmware-extract omarchy-settings omarchy omarchy-nvim
+        aether cliamp herdr localsend-bin mise-bin omacalc omacut omawrite omarchy-chromium-bin
+        ttfx yay tobi-try ttf-ia-writer ufw-docker xdg-terminal-exec yaru-icon-theme
+        tzupdate tensaku hyprtoolkit hyprland-guiutils hyprland hyprland-preview-share-picker
+    steps:
+      - name: Checkout omarchy-pkgs
+        uses: actions/checkout@v4
+        with:
+          repository: birkskyum/omarchy-pkgs
+          ref: d049fb66c50c02a2dcf92dd51289261d35e22dec
+
+
+      - name: Integrate pinned Yoga runtime and ARM boot settings
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          curl --fail --location --retry 3 https://raw.githubusercontent.com/omacom/omarchy-pkgs/ccecdbde56a0174a7962ccffaabe412f96d0c4cd/pkgbuilds/omarchy-settings/PKGBUILD -o pkgbuilds/omarchy-settings/PKGBUILD
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          for name in ('omarchy', 'omarchy-settings'):
+              p = Path('pkgbuilds') / name / 'PKGBUILD'
+              s = p.read_text()
+              for pattern, replacement in [
+                  (r"(?m)^_tag=.*$", "_tag=''"),
+                  (r"(?m)^_commit=.*$", "_commit='66a33c339914cfa0e41ec1fce8f198ea779b8aea'"),
+                  (r"(?m)^pkgver=.*$", "pkgver=4.0.3"),
+                  (r"(?m)^pkgrel=.*$", "pkgrel=1"),
+                  (r"(?m)^  sha256sums=\('[0-9a-f]{64}'\)$", "  sha256sums=('SKIP')"),
+              ]:
+                  s, count = re.subn(pattern, replacement, s)
+                  assert count == 1, (name, pattern, count)
+              # VCS source is fixed to the full commit above; no moving branch.
+              p.write_text(s)
+          PY
+          bash -n pkgbuilds/omarchy/PKGBUILD pkgbuilds/omarchy-settings/PKGBUILD
+          git diff --check
+
+      - name: Resolve inputs
+        id: meta
+        run: |
+          MIRROR="${INPUT_MIRROR:-edge}"
+          PACKAGES="$INPUT_PACKAGES"
+          case "$MIRROR" in edge|rc|stable) ;; *) echo "invalid mirror: $MIRROR" >&2; exit 1 ;; esac
+          re='^[A-Za-z0-9._+ -]*$'
+          if ! [[ $PACKAGES =~ $re ]]; then echo "invalid package list" >&2; exit 1; fi
+          read -r -a pkgbases <<< "$PACKAGES"
+          for package in "${pkgbases[@]}"; do
+            if ! [[ $package =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && -f pkgbuilds/$package/PKGBUILD ]]; then
+              echo "unknown pkgbase: $package" >&2
+              exit 1
+            fi
+          done
+          PACKAGES="${pkgbases[*]}"
+          {
+            echo "MIRROR=$MIRROR"
+            echo "PACKAGES=$PACKAGES"
+            echo "REPO_DIR=pkgs.omarchy.org/$MIRROR/$ARCH"
+            echo "OUTPUT_DIR=build-output/$MIRROR/$ARCH"
+          } >> "$GITHUB_ENV"
+          echo "artifact=omarchy-repo-$ARCH-$MIRROR" >> "$GITHUB_OUTPUT"
+          echo "packages_key=$(printf '%s\0' "${pkgbases[@]}" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # Reuse packages whose build inputs have not changed.
+      - name: Restore repository tree
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.REPO_DIR }}
+          key: omarchy-repo-v2-${{ env.ARCH }}-${{ env.MIRROR }}-${{ steps.meta.outputs.packages_key }}-${{ hashFiles('pkgbuilds/**', 'build/**', 'helpers/**', 'bin/**') }}
+
+      # The builder and runner use different user IDs.
+      - name: Prepare output directories
+        run: |
+          mkdir -p "$OUTPUT_DIR" "$REPO_DIR" src logs
+          chmod -R a+rwX build-output pkgs.omarchy.org src
+
+      - name: Build plan
+        run: |
+          read -r -a pkgbases <<< "$PACKAGES"
+          bin/repo build --arch "$ARCH" --mirror "$MIRROR" --dry-run --package "${pkgbases[@]}"
+
+      - name: Build packages
+        run: |
+          read -r -a pkgbases <<< "$PACKAGES"
+          bin/repo build --arch "$ARCH" --mirror "$MIRROR" --package "${pkgbases[@]}"
+
+      # Replaces bin/repo sign + promote, which need the repository host's key.
+      - name: Publish into the repository tree and write omarchy.db
+        run: |
+          shopt -s nullglob
+          files=("$OUTPUT_DIR"/*.pkg.tar.zst "$OUTPUT_DIR"/*.pkg.tar.xz)
+          echo "new package files: ${#files[@]}"
+          [[ ${#files[@]} -gt 0 ]] && cp -v "${files[@]}" "$REPO_DIR/"
+          chmod -R a+rwX pkgs.omarchy.org
+          bin/repo update --arch "$ARCH" --mirror "$MIRROR"
+
+      - name: Verify repository
+        id: verify
+        run: |
+          source helpers/package-metadata.sh
+          recipes="$PWD/pkgbuilds"
+          cd "$REPO_DIR"
+          dbdir=$(mktemp -d)
+          trap 'rm -rf "$dbdir"' EXIT
+          tar --use-compress-program=unzstd -xf omarchy.db.tar.zst -C "$dbdir"
+          for desc in "$dbdir"/*/desc; do
+            awk '
+              /^%BASE%$/ { getline; base=$0 }
+              /^%NAME%$/ { getline; name=$0 }
+              END { print (base != "" ? base : name) }
+            ' "$desc"
+          done > "$dbdir/pkgbases"
+          echo "== pkgbases in omarchy.db =="
+          sort -u "$dbdir/pkgbases"
+          missing=0
+          read -r -a pkgbases <<< "$PACKAGES"
+          for p in "${pkgbases[@]}"; do
+            base=$(package_pkgbuild_var "$recipes/$p" pkgbase)
+            [[ -n $base ]] || base=$(package_pkgbuild_var "$recipes/$p" pkgname)
+            grep -Fxq "$base" "$dbdir/pkgbases" || { echo "missing pkgbase: $base ($p)" >&2; missing=1; }
+          done
+          du -sh .
+          exit $missing
+
+      - name: Upload repository artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact }}
+          path: ${{ env.REPO_DIR }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ env.ARCH }}-${{ env.MIRROR }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-iso:
+    needs: packages
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    env:
+      ISO_MAKE_ARGS: ""
+      MEDIA_TARGET: aarch64/snapdragon
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: omacom/omarchy-iso
+          ref: cac0cc26f8f295f5cfa94f1427aa2e90454814d0
+          submodules: true
+
+      - name: Runner facts
+        run: |
+          set -x
+          uname -a
+          nproc
+          free -h
+          df -h
+          docker version --format '{{.Server.Version}}'
+          docker info --format '{{.Driver}} {{.DockerRootDir}}'
+
+      - name: Test ARM live build configuration
+        run: |
+          bash test/unit/arch-package-filter-test.sh
+          bash test/unit/aarch64-initramfs-test.sh
+          python3 -m unittest discover -s test/unit -p test_local_repo_config.py
+          python3 -m unittest discover -s test/unit -p test_iso_architecture.py
+          python3 -m unittest discover -s test/unit -p test_live_dsp.py
+          python3 -m unittest discover -s test/unit -p test_hardware_platforms.py
+          python3 -m unittest discover -s test/unit -p test_keyboard.py
+
+      # The hosted runner's root disk is too small for both build stages.
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        continue-on-error: true
+
+      - name: Disk after cleanup
+        run: df -h
+
+      - name: Download the aarch64 [omarchy] repository
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.packages.outputs.artifact }}
+          path: omarchy-repo
+
+      - name: Inspect the repository
+        run: |
+          test -f omarchy-repo/omarchy.db
+          ls -la omarchy-repo | sed -n '1,50p'
+          du -sh omarchy-repo
+
+      - name: Build ISO
+        run: |
+          re='^[A-Za-z0-9 ._=/-]*$'
+          [[ $ISO_MAKE_ARGS =~ $re ]] || { echo "invalid iso_make_args" >&2; exit 1; }
+          start=$(date +%s)
+          NO_BOOT_OFFER=1 ./bin/omarchy-iso-make --keep-pkg-cache --local-repo "$PWD/omarchy-repo" $ISO_MAKE_ARGS --arch aarch64 --media-target "$MEDIA_TARGET"
+          echo "ISO build wall-clock: $(( $(date +%s) - start ))s"
+
+      - name: Inspect ISO
+        run: |
+          sudo apt-get install -y -qq xorriso >/dev/null
+          ls -l release/
+          for iso in release/*.iso; do
+            echo "== $iso"
+            (cd release && sha256sum "$(basename "$iso")" > "$(basename "$iso").sha256")
+            xorriso -indev "$iso" -ls /EFI/BOOT/BOOTAA64.EFI 2>/dev/null
+            xorriso -indev "$iso" -ls /EFI/BOOT/ 2>/dev/null
+            xorriso -indev "$iso" -lsl /arch/boot/aarch64/ 2>/dev/null
+            if [[ $MEDIA_TARGET == aarch64/snapdragon ]]; then
+              xorriso -indev "$iso" -ls /arch/boot/aarch64/omarchy-live.efi 2>/dev/null \
+                || { echo "ISO is missing the DTB-carrying live UKI" >&2; exit 1; }
+            else
+              [[ $iso == release/omarchy-generic-*-aarch64-*.iso ]]
+            fi
+          done
+          df -h
+
+      - name: Upload newly built ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omarchy-yoga-slim7x-arm64
+          path: |
+            ./release/*.iso
+            ./release/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+
