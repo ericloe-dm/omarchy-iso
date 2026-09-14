@@ -187,6 +187,9 @@ jobs:
           docker info --format '{{.Driver}} {{.DockerRootDir}}'
 
       - name: Test ARM live build configuration
+        env:
+          # Tests run unprivileged, outside the live installer's /root environment.
+          OMARCHY_ISO_REF: stable
         run: |
           bash test/unit/arch-package-filter-test.sh
           bash test/unit/aarch64-initramfs-test.sh
